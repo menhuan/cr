@@ -1,0 +1,23 @@
+services:
+  code-review-service:
+    image: krccr.ccs.tencentyun.com/qunar/aicr:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: code-review-service
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src  # 用于开发时热重载
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  default:
+    name: code-review-network
