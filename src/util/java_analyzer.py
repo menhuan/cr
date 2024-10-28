@@ -55,10 +55,9 @@ class JavaCodeAnalyzer:
             self._check_performance(content, analysis)
             
             #todo 安全性检查
-            #self._check_security(content, analysis)
+            self._check_security(content, analysis)
             
-            #todo 常见错误检查
-            #self._check_common_mistakes(content, analysis)
+            self._check_common_mistakes(content, analysis)
             
         except Exception as e:
             logger.exception(f"Error analyzing Java file {file_path}")
@@ -399,6 +398,22 @@ class JavaCodeAnalyzer:
             
         # 确保分数在0-100之间
         return max(0, min(100, score))
+
+    def _check_common_mistakes(self, content: str, analysis: Dict[str, Any]) -> None:
+        """检查常见错误"""
+        common_mistakes = self.rules.get('common_mistakes', [])
+        
+        for mistake in common_mistakes:
+            if re.search(mistake['pattern'], content):
+                analysis['warnings'].append(mistake['message'])
+
+    def _check_security(self, content: str, analysis: Dict[str, Any]) -> None:
+        """检查安全性问题"""
+        security_checks = self.rules.get('security_checks', [])
+        
+        for check in security_checks:
+            if re.search(check['pattern'], content):
+                analysis['issues'].append(check['message'])
 
 class JavaAnalysisRules:
     """Java代码分析规则集"""
