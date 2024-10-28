@@ -32,6 +32,7 @@ class GitLabMRParser:
         """初始化"""
         self.gl = gitlab.Gitlab(url=gitlab_url, private_token=gitlab_token)
         self.java_analyzer = JavaCodeAnalyzer()  # 初始化Java分析器
+        self.ai_reviewer = AICodeReviewer()
     def parse_mr_url(self, url: str) -> Dict[str, str]:
         """
         解析 GitLab MR URL
@@ -225,30 +226,32 @@ class GitLabMRParser:
 
         for change in changes:
             try:
+                file_path = change.get('new_path', '')
+                if not file_path or not change.get('diff'):
+                    continue
+
                 # 基本文件分析
+                file_analysis = self._analyze_single_file(change)
+                review_results['files_analysis'].append(file_analysis)
                 
+                # 收集行评论
+                if file_analysis.get('line_comments'):
+                    review_results['line_comments'][file_path] = file_analysis['line_comments']
                 
                 # Java特定分析
-                if self._is_java_file(change.get('new_path', '')):
+                if self._is_java_file(file_path):
                     java_analysis = self._analyze_java_file(change)
                     if java_analysis:
                         review_results['java_analysis']['files_analyzed'] += 1
-                        review_results['java_analysis']['total_issues'] += (
-                            len(java_analysis.get('issues', [])) +
-                            len(java_analysis.get('warnings', [])) +
-                            len(java_analysis.get('suggestions', []))
-                        )
-                        review_results['java_analysis']['critical_issues'] += len(
-                            [i for i in java_analysis.get('issues', []) 
-                             if i.get('severity') == 'HIGH']
-                        )
-                        review_results['java_analysis']['warnings'] += len(
-                            java_analysis.get('warnings', [])
-                        )
-                        review_results['java_analysis']['suggestions'] += len(
-                            java_analysis.get('suggestions', [])
-                        )
-                        review_results['java_analysis']['file_results'].append(java_analysis)
+                        # ... 其他 Java 分析统计 ...
+                        
+                        # 收集 Java 分析产生的行评论
+                        if java_analysis.get('line_comments'):
+                            if file_path not in review_results['line_comments']:
+                                review_results['line_comments'][file_path] = {}
+                            review_results['line_comments'][file_path].update(
+                                java_analysis['line_comments']
+                            )
                 
                 # 更新统计信息
                 if change.get('new_path'):
@@ -267,6 +270,46 @@ class GitLabMRParser:
                 logger.exception(f"Error analyzing file: {change.get('new_path', 'unknown file')}")
                 
         return review_results
+    def _analyze_single_file(self, change: Dict[str, Any]) -> Dict[str, Any]:
+        """分析单个文件"""
+        file_path = change.get('new_path', '')
+        file_analysis = {
+            'file_path': file_path,
+            'change_type': self._determine_change_type(change),
+            'issues': [],
+            'warnings': [],
+            'suggestions': [],
+            'line_comments': {}  # 添加行评论收集
+        }
+
+        try:
+            if change.get('diff'):
+                current_line = 0
+                
+                # 分析diff获取行号
+                diff_lines = change['diff'].split('\n')
+                for line in diff_lines:
+                    if line.startswith('@@'):
+                        match = re.search(r'\+(\d+)', line)
+                        if match:
+                            current_line = int(match.group(1)) - 1
+                        continue
+                    
+                    if line.startswith('+'):
+                        current_line += 1
+                        # 分析新添加的代码行
+                        line_issues = self._analyze_code_line(line[1:], file_path)
+                        if line_issues:
+                            file_analysis['line_comments'][current_line] = line_issues
+                    
+                    elif line.startswith(' '):
+                        current_line += 1
+
+        except Exception as e:
+            logger.exception(f"Error analyzing file: {file_path}")
+            file_analysis['issues'].append(f"文件分析错误: {str(e)}")
+
+        return file_analysis
 
     def _is_java_file(self, file_path: str) -> bool:
         """判断是否是Java文件"""
@@ -347,6 +390,8 @@ class GitLabMRParser:
                         comment_parts.append(f"- {metric}: {value}")
         
         return '\n'.join(comment_parts)
+    
+    
     def _format_review_comment(self, review_results: Dict[str, Any]) -> str:
         """
         格式化代码评审评论
@@ -515,87 +560,107 @@ class GitLabMRParser:
         return recommendations
 
 
-    def submit_review_comment(self, mr: ProjectMergeRequest, review_results: Dict[str, Any]) -> None:
-        """提交评审评论"""
-        # 生成常规评论
-        comment = self._format_review_comment(review_results)
+    def _submit_line_comments(self, mr: ProjectMergeRequest, line_comments: Dict[str, Dict[int, List[str]]]) -> None:
+        """
+        提交行级别评论
         
-        # 如果有Java分析结果，添加Java特定评论
-        if review_results.get('java_analysis', {}).get('files_analyzed', 0) > 0:
-            java_comment = self.format_java_review_comment(review_results['java_analysis'])
-            comment = f"{comment}\n\n{java_comment}"
-            
-            # 如果存在严重问题，添加醒目提示
-            critical_issues = review_results['java_analysis']['critical_issues']
-            if critical_issues > 0:
-                alert = (
-                    "\n⚠️ **警告提示**\n"
-                    f"发现 {critical_issues} 个严重问题需要处理，"
-                    "建议在合并前修复这些问题。"
-                )
-                comment = f"{alert}\n\n{comment}"
-        
+        Args:
+            mr: MR对象
+            line_comments: 行评论字典 {file_path: {line_number: [comments]}}
+        """
         try:
-            # 提交总评论
-            mr.notes.create({
-                'body': comment
-            })
-            logger.info("Successfully submitted review comment")
+            # 配置批处理大小
+            BATCH_SIZE = 5
             
-            # 提交行级别评论
-            self._submit_line_comments(mr, review_results)
-            
-        except Exception as e:
-            logger.exception("Failed to submit review comments")
-            raise
-
-    def _submit_line_comments(self, mr: ProjectMergeRequest, review_results: Dict[str, Any]) -> None:
-        """提交行级别评论"""
-        try:
-            # 2. 处理每个文件的行级别评论
-            changes = mr.changes()
-            for change in changes['changes']:
-                file_path = change.get('new_path')
-                if not file_path or not change.get('diff'):
+            # 按文件处理评论
+            for file_path, comments in line_comments.items():
+                logger.info(f"Creating comments for file: {file_path}")
+                
+                if not comments:
                     continue
-
-                # 解析diff获取行号映射
-                line_mapping = self._parse_diff_line_numbers(change['diff'])
+                    
+                # 使用批量处理方法提交评论
+                self._create_batch_comments(
+                    mr=mr,
+                    file_path=file_path,
+                    comments=comments,
+                    batch_size=BATCH_SIZE
+                )
                 
-                # 收集该文件的所有行级别评论
-                line_comments = self._collect_line_comments(change, review_results)
-                
-                # 提交行级别评论
-                self._submit_file_line_comments(mr, file_path, line_comments, change)
-                
-            logger.info("Successfully submitted all review comments")
-        
+                logger.info(f"Successfully submitted comments for {file_path}")
+                        
         except Exception as e:
             logger.exception("Failed to submit line comments")
             raise
 
-    def _prepare_line_comments(self, file_result: Dict[str, Any]) -> Dict[int, List[str]]:
-        """准备行级别评论"""
-        line_comments = {}
+    def _create_batch_comments(self, mr: ProjectMergeRequest, file_path: str, 
+                            comments: Dict[int, List[str]], batch_size: int = 5) -> None:
+        """
+        批量创建评论
         
-        # 处理每种类型的问题
-        for issue_type in ['issues', 'warnings', 'suggestions']:
-            for item in file_result.get(issue_type, []):
-                if isinstance(item, dict) and 'line_number' in item:
-                    line_num = item['line_number']
-                    if line_num not in line_comments:
-                        line_comments[line_num] = []
-                    
-                    prefix = {
-                        'issues': '❌',
-                        'warnings': '⚠️',
-                        'suggestions': '💡'
-                    }.get(issue_type, '')
-                    
-                    line_comments[line_num].append(f"{prefix} {item['message']}")
-        
-        return line_comments
+        Args:
+            mr: MR对象
+            file_path: 文件路径
+            comments: 评论字典 {line_number: [comments]}
+            batch_size: 批次大小
+        """
+        try:
+            # 获取必要的SHA值
+            base_sha = mr.diff_refs['base_sha']
+            head_sha = mr.diff_refs['head_sha']
+            start_sha = mr.diff_refs.get('start_sha', base_sha)
+            
+            # 将评论按批次处理
+            comment_items = list(comments.items())
+            total_batches = len(comment_items) // batch_size + (1 if len(comment_items) % batch_size > 0 else 0)
+            
+            for batch_index in range(total_batches):
+                start_idx = batch_index * batch_size
+                end_idx = min(start_idx + batch_size, len(comment_items))
+                batch = dict(comment_items[start_idx:end_idx])
+                
+                logger.debug(f"Processing batch {batch_index + 1}/{total_batches} for {file_path}")
+                
+                # 处理当前批次的评论
+                for line_num, issues in batch.items():
+                    try:
+                        # 格式化评论内容
+                        comment_body = self._format_line_comment_body(issues)
+                        
+                        # 创建评论
+                        position_data = {
+                            'base_sha': base_sha,
+                            'start_sha': start_sha,
+                            'head_sha': head_sha,
+                            'position_type': 'text',
+                            'new_path': file_path,
+                            'new_line': line_num,
+                            'old_path': file_path,
+                            'old_line': None
+                        }
+                        
+                        mr.discussions.create({
+                            'body': comment_body,
+                            'position': position_data
+                        })
+                        
+                        logger.debug(f"Created comment for line {line_num} in {file_path}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create comment for line {line_num} in {file_path}: {str(e)}")
+                
+                # 添加延迟以避免触发API限制
+                if batch_index < total_batches - 1:  # 如果不是最后一批，添加延迟
+                    time.sleep(1)
+                
+            logger.info(f"Completed submitting {len(comments)} comments for {file_path}")
+                
+        except Exception as e:
+            logger.exception(f"Failed to create batch comments for {file_path}")
+            raise
 
+    
+    
     def review_mr(self, url: str, batch_size: int = 5) -> Dict[str, Any]:
         """
         执行MR评审
@@ -625,6 +690,12 @@ class GitLabMRParser:
             
             # 分析代码
             review_results = self.analyze_code_changes(changes['changes'])
+            
+            # 使用 AI 进行代码评审
+            ai_review_results = self.ai_reviewer.review_code_changes(changes['changes'])
+            if ai_review_results.get('success'):
+                review_results['ai_review'] = ai_review_results
+        
             
             # 构建结果
             results = {
@@ -667,7 +738,7 @@ class GitLabMRParser:
             self._submit_overview_comment(mr, review_results)
             
             # 2. 批量提交行评论
-            self._submit_line_comments_in_batches(mr, review_results, batch_size)
+            self._submit_line_comments(mr, review_results)
             
             logger.info("Successfully submitted all review comments")
             
@@ -689,6 +760,12 @@ class GitLabMRParser:
             
             # 生成并提交评论
             overview_comment = self._format_review_comment(review_results)
+            
+             # 2. 如果有 AI 评审结果，添加到评论中
+            if 'ai_review' in review_results:
+                ai_comment = self.ai_reviewer.format_review_comment(review_results['ai_review'])
+                overview_comment = f"{overview_comment}\n\n{ai_comment}"
+            
             mr.notes.create({'body': overview_comment})
             
             logger.info("Successfully submitted overview comment")
@@ -697,49 +774,75 @@ class GitLabMRParser:
             logger.exception("Failed to submit overview comment")
             raise
 
-    def _submit_line_comments_in_batches(self, mr: ProjectMergeRequest, 
-                                       review_results: Dict[str, Any], 
-                                       batch_size: int) -> None:
-        """
-        批量提交行评论
-        
-        Args:
-            mr: MR对象
-            review_results: 评审结果
-            batch_size: 批处理大小
-        """
+    def _submit_line_comments(self, mr: ProjectMergeRequest, review_results: Dict[str, Any]) -> None:
+        """提交行级别评论"""
         try:
-            total_comments = 0
+            # 1. 处理常规分析的行评论
+            for file_analysis in review_results.get('files_analysis', []):
+                if file_analysis.get('line_comments'):
+                    self._create_line_comments(
+                        mr, 
+                        file_analysis['file_path'],
+                        file_analysis['line_comments']
+                    )
             
-            for change in review_results.get('changes', []):
-                file_path = change.get('new_path')
-                if not file_path or not change.get('diff'):
-                    continue
-
-                # 收集行评论
-                line_comments = self._collect_line_comments(change, review_results)
-                if not line_comments:
-                    continue
-
-                # 按批次处理评论
-                comment_items = list(line_comments.items())
-                for i in range(0, len(comment_items), batch_size):
-                    batch = dict(comment_items[i:i + batch_size])
-                    # 添加延迟以避免请求过快
-                    sleep(2)
-                    
-                    # 提交这批评论
-                    self._submit_line_comments(mr, file_path, batch, change)
-                    total_comments += len(batch)
-                    
-                    logger.debug(f"Submitted batch of {len(batch)} comments for {file_path}")
-                    
-            logger.info(f"Successfully submitted {total_comments} line comments in total")
-            
+            # 2. 处理 AI 分析的行评论
+            if 'ai_review' in review_results:
+                for file_review in review_results['ai_review'].get('file_reviews', []):
+                    if file_review.get('line_issues'):
+                        comments = self.ai_reviewer._format_line_comment(
+                            file_review['file_path'],
+                            file_review['line_issues']
+                        )
+                        self._create_line_comments(
+                            mr,
+                            file_review['file_path'],
+                            comments
+                        )
+                        
         except Exception as e:
-            logger.exception("Failed to submit line comments in batches")
+            logger.exception("Failed to submit line comments")
             raise
-
+    
+    def _create_line_comments(
+        self, 
+        mr: ProjectMergeRequest, 
+        file_path: str, 
+        comments: Dict[int, List[str]]
+    ) -> None:
+        """创建行级别评论"""
+        try:
+            base_sha = mr.diff_refs['base_sha']
+            head_sha = mr.diff_refs['head_sha']
+            start_sha = mr.diff_refs.get('start_sha', base_sha)
+            
+            for line_num, comment_list in comments.items():
+                comment_body = "\n".join([
+                    f"- {comment}" for comment in comment_list
+                ])
+                
+                position_data = {
+                    'base_sha': base_sha,
+                    'start_sha': start_sha,
+                    'head_sha': head_sha,
+                    'position_type': 'text',
+                    'new_path': file_path,
+                    'new_line': line_num,
+                    'old_path': file_path,
+                    'old_line': None
+                }
+                
+                mr.discussions.create({
+                    'body': comment_body,
+                    'position': position_data
+                })
+                
+                logger.debug(f"Created comment for line {line_num} in {file_path}")
+                
+        except Exception as e:
+            logger.exception(f"Failed to create line comments for {file_path}")
+            raise    
+    
     def _get_file_type_analyzer(self, file_path: str) -> Any:
         """
         获取文件类型对应的分析器
@@ -1055,6 +1158,286 @@ class GitLabMRParser:
         """
         return [comments[i:i + chunk_size] for i in range(0, len(comments), chunk_size)]
 
+    def analyze_code_changes(self, changes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """分析代码变更"""
+        logger.info("Starting code analysis")
+        review_results = {
+            'summary': {
+                'total_files': len(changes),
+                'total_additions': 0,
+                'total_deletions': 0,
+                'file_types': {}
+            },
+            'files_analysis': [],
+            'line_comments': {},  # 添加行评论收集
+            'java_analysis': {
+                'files_analyzed': 0,
+                'total_issues': 0,
+                'critical_issues': 0,
+                'warnings': 0,
+                'suggestions': 0,
+                'file_results': []
+            }
+        }
+
+        for change in changes:
+            try:
+                file_path = change.get('new_path', '')
+                if not file_path or not change.get('diff'):
+                    continue
+
+                # 基本文件分析
+                file_analysis = self._analyze_single_file(change)
+                review_results['files_analysis'].append(file_analysis)
+                
+                # 收集行评论
+                if file_analysis.get('line_comments'):
+                    review_results['line_comments'][file_path] = file_analysis['line_comments']
+                
+                # Java特定分析
+                if self._is_java_file(file_path):
+                    java_analysis = self._analyze_java_file(change)
+                    if java_analysis:
+                        review_results['java_analysis']['files_analyzed'] += 1
+                        # ... 其他 Java 分析统计 ...
+                        
+                        # 收集 Java 分析产生的行评论
+                        if java_analysis.get('line_comments'):
+                            if file_path not in review_results['line_comments']:
+                                review_results['line_comments'][file_path] = {}
+                            review_results['line_comments'][file_path].update(
+                                java_analysis['line_comments']
+                            )
+                
+                # 更新统计信息
+                if change.get('new_path'):
+                    file_ext = change['new_path'].split('.')[-1] if '.' in change['new_path'] else 'no_extension'
+                    review_results['summary']['file_types'][file_ext] = \
+                        review_results['summary']['file_types'].get(file_ext, 0) + 1
+
+                # 统计变更行数
+                if change.get('diff'):
+                    additions = len(re.findall(r'^\+[^+]', change['diff'], re.MULTILINE))
+                    deletions = len(re.findall(r'^-[^-]', change['diff'], re.MULTILINE))
+                    review_results['summary']['total_additions'] += additions
+                    review_results['summary']['total_deletions'] += deletions
+                    
+            except Exception as e:
+                logger.exception(f"Error analyzing file: {change.get('new_path', 'unknown file')}")
+                
+        return review_results
+
+    def _analyze_single_file(self, change: Dict[str, Any]) -> Dict[str, Any]:
+        """分析单个文件"""
+        file_path = change.get('new_path', '')
+        file_analysis = {
+            'file_path': file_path,
+            'change_type': self._determine_change_type(change),
+            'issues': [],
+            'warnings': [],
+            'suggestions': [],
+            'line_comments': {}  # 添加行评论收集
+        }
+
+        try:
+            if change.get('diff'):
+                current_line = 0
+                
+                # 分析diff获取行号
+                diff_lines = change['diff'].split('\n')
+                for line in diff_lines:
+                    if line.startswith('@@'):
+                        match = re.search(r'\+(\d+)', line)
+                        if match:
+                            current_line = int(match.group(1)) - 1
+                        continue
+                    
+                    if line.startswith('+'):
+                        current_line += 1
+                        # 分析新添加的代码行
+                        line_issues = self._analyze_code_line(line[1:], file_path)
+                        if line_issues:
+                            file_analysis['line_comments'][current_line] = line_issues
+                    
+                    elif line.startswith(' '):
+                        current_line += 1
+
+        except Exception as e:
+            logger.exception(f"Error analyzing file: {file_path}")
+            file_analysis['issues'].append(f"文件分析错误: {str(e)}")
+
+        return file_analysis
+
+    def _submit_review_results(self, mr: ProjectMergeRequest, review_results: Dict[str, Any]) -> None:
+        """提交评审结果"""
+        try:
+            # 1. 提交总体评论
+            overview_comment = self._format_review_comment(review_results)
+            
+            # 2. 如果有 AI 评审结果，添加到评论中
+            if 'ai_review' in review_results:
+                ai_comment = self.ai_reviewer.format_review_comment(review_results['ai_review'])
+                overview_comment = f"{overview_comment}\n\n{ai_comment}"
+            
+            mr.notes.create({'body': overview_comment})
+            logger.info("Successfully submitted overview comment")
+            
+            # 3. 提交行级别评论
+            if review_results.get('line_comments'):
+                self._submit_line_comments(mr, review_results['line_comments'])
+            
+            logger.info("Successfully submitted all review comments")
+            
+        except Exception as e:
+            logger.exception("Failed to submit review results")
+            raise
+
+    def _submit_line_comments(self, mr: ProjectMergeRequest, line_comments: Dict[str, Dict[int, List[str]]]) -> None:
+        """
+        提交行级别评论
+        
+        Args:
+            mr: MR对象
+            line_comments: 行评论字典 {file_path: {line_number: [comments]}}
+        """
+        try:
+            base_sha = mr.diff_refs['base_sha']
+            head_sha = mr.diff_refs['head_sha']
+            start_sha = mr.diff_refs.get('start_sha', base_sha)
+            
+            # 按文件处理评论
+            for file_path, comments in line_comments.items():
+                logger.info(f"Creating comments for file: {file_path}")
+                
+                # 按行处理评论
+                for line_num, line_issues in comments.items():
+                    try:
+                        # 格式化评论内容
+                        comment_body = self._format_line_comment_body(line_issues)
+                        
+                        # 创建评论
+                        position_data = {
+                            'base_sha': base_sha,
+                            'start_sha': start_sha,
+                            'head_sha': head_sha,
+                            'position_type': 'text',
+                            'new_path': file_path,
+                            'new_line': line_num,
+                            'old_path': file_path,
+                            'old_line': None
+                        }
+                        
+                        mr.discussions.create({
+                            'body': comment_body,
+                            'position': position_data
+                        })
+                        
+                        logger.debug(f"Created comment for line {line_num} in {file_path}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create comment for line {line_num} in {file_path}: {str(e)}")
+                        
+        except Exception as e:
+            logger.exception("Failed to submit line comments")
+            raise
+
+    def _format_line_comment_body(self, issues: List[str]) -> str:
+        """
+        格式化行评论内容
+        
+        Args:
+            issues: 问题列表
+            
+        Returns:
+            格式化后的评论内容
+        """
+        # 按类型对问题进行分类
+        categorized_issues = {
+            '❌ 严重问题': [],
+            '⚠️ 警告': [],
+            '💡 建议': []
+        }
+        
+        for issue in issues:
+            if any(keyword in issue.lower() for keyword in ['error', 'critical', 'severe', '严重']):
+                categorized_issues['❌ 严重问题'].append(issue)
+            elif any(keyword in issue.lower() for keyword in ['warning', 'caution', '警告']):
+                categorized_issues['⚠️ 警告'].append(issue)
+            else:
+                categorized_issues['💡 建议'].append(issue)
+        
+        # 构建评论内容
+        comment_parts = ['### 代码评审意见']
+        
+        for category, category_issues in categorized_issues.items():
+            if category_issues:
+                comment_parts.append(f"\n**{category}:**")
+                for issue in category_issues:
+                    comment_parts.append(f"- {issue}")
+        
+        # 如果有建议的代码示例，添加到评论中
+        if any('example' in issue.lower() or '示例' in issue for issue in issues):
+            comment_parts.append("\n**💻 参考示例:**")
+            for issue in issues:
+                if 'example' in issue.lower() or '示例' in issue:
+                    comment_parts.append("```java\n" + issue.split('example:')[-1].strip() + "\n```")
+        
+        return "\n".join(comment_parts)
+
+    def _create_batch_comments(self, mr: ProjectMergeRequest, file_path: str, 
+                         comments: Dict[int, List[str]], batch_size: int = 5) -> None:
+        """
+        批量创建评论
+        
+        Args:
+            mr: MR对象
+            file_path: 文件路径
+            comments: 评论字典
+            batch_size: 批次大小
+        """
+        try:
+            # 获取必要的SHA值
+            base_sha = mr.diff_refs['base_sha']
+            head_sha = mr.diff_refs['head_sha']
+            start_sha = mr.diff_refs.get('start_sha', base_sha)
+            
+            # 将评论按批次处理
+            comment_items = list(comments.items())
+            for i in range(0, len(comment_items), batch_size):
+                batch = dict(comment_items[i:i + batch_size])
+                
+                for line_num, issues in batch.items():
+                    try:
+                        comment_body = self._format_line_comment_body(issues)
+                        position_data = {
+                            'base_sha': base_sha,
+                            'start_sha': start_sha,
+                            'head_sha': head_sha,
+                            'position_type': 'text',
+                            'new_path': file_path,
+                            'new_line': line_num,
+                            'old_path': file_path,
+                            'old_line': None
+                        }
+                        
+                        mr.discussions.create({
+                            'body': comment_body,
+                            'position': position_data
+                        })
+                        
+                        logger.debug(f"Created comment for line {line_num} in {file_path}")
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to create comment for line {line_num}: {str(e)}")
+                
+                # 添加延迟以避免触发API限制
+                sleep(1)
+                
+        except Exception as e:
+            logger.exception(f"Failed to create batch comments for {file_path}")
+            raise
+
+   
 
 
 def main():
