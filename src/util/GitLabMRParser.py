@@ -11,6 +11,8 @@ import os
 from src.logger import logger  # 直接导入配置好的 logger
 from typing import Dict, List, Any
 from .java_analyzer import JavaCodeAnalyzer
+from .ai_code_reviewer import AICodeReviewer
+
 from time import sleep
 
 def pretty_print_json(data: Dict[str, Any], title: str = None) -> None:
@@ -32,7 +34,8 @@ class GitLabMRParser:
         """初始化"""
         self.gl = gitlab.Gitlab(url=gitlab_url, private_token=gitlab_token)
         self.java_analyzer = JavaCodeAnalyzer()  # 初始化Java分析器
-        self.ai_reviewer = AICodeReviewer()
+        self.ai_reviewer = AICodeReviewer() # 初始化 ai 分析
+        
     def parse_mr_url(self, url: str) -> Dict[str, str]:
         """
         解析 GitLab MR URL
@@ -229,15 +232,6 @@ class GitLabMRParser:
                 file_path = change.get('new_path', '')
                 if not file_path or not change.get('diff'):
                     continue
-
-                # 基本文件分析
-                file_analysis = self._analyze_single_file(change)
-                review_results['files_analysis'].append(file_analysis)
-                
-                # 收集行评论
-                if file_analysis.get('line_comments'):
-                    review_results['line_comments'][file_path] = file_analysis['line_comments']
-                
                 # Java特定分析
                 if self._is_java_file(file_path):
                     java_analysis = self._analyze_java_file(change)
@@ -270,47 +264,8 @@ class GitLabMRParser:
                 logger.exception(f"Error analyzing file: {change.get('new_path', 'unknown file')}")
                 
         return review_results
-    def _analyze_single_file(self, change: Dict[str, Any]) -> Dict[str, Any]:
-        """分析单个文件"""
-        file_path = change.get('new_path', '')
-        file_analysis = {
-            'file_path': file_path,
-            'change_type': self._determine_change_type(change),
-            'issues': [],
-            'warnings': [],
-            'suggestions': [],
-            'line_comments': {}  # 添加行评论收集
-        }
-
-        try:
-            if change.get('diff'):
-                current_line = 0
-                
-                # 分析diff获取行号
-                diff_lines = change['diff'].split('\n')
-                for line in diff_lines:
-                    if line.startswith('@@'):
-                        match = re.search(r'\+(\d+)', line)
-                        if match:
-                            current_line = int(match.group(1)) - 1
-                        continue
-                    
-                    if line.startswith('+'):
-                        current_line += 1
-                        # 分析新添加的代码行
-                        line_issues = self._analyze_code_line(line[1:], file_path)
-                        if line_issues:
-                            file_analysis['line_comments'][current_line] = line_issues
-                    
-                    elif line.startswith(' '):
-                        current_line += 1
-
-        except Exception as e:
-            logger.exception(f"Error analyzing file: {file_path}")
-            file_analysis['issues'].append(f"文件分析错误: {str(e)}")
-
-        return file_analysis
-
+    
+    
     def _is_java_file(self, file_path: str) -> bool:
         """判断是否是Java文件"""
         return file_path and file_path.endswith('.java')
@@ -710,7 +665,7 @@ class GitLabMRParser:
             }
             
             # 提交评论（使用批处理）
-            self._submit_review_results(mr, results, batch_size)
+            self._submit_review_results(mr=mr, review_results=results)
             
             logger.info("Code review completed successfully")
             return results
@@ -1185,14 +1140,6 @@ class GitLabMRParser:
                 file_path = change.get('new_path', '')
                 if not file_path or not change.get('diff'):
                     continue
-
-                # 基本文件分析
-                file_analysis = self._analyze_single_file(change)
-                review_results['files_analysis'].append(file_analysis)
-                
-                # 收集行评论
-                if file_analysis.get('line_comments'):
-                    review_results['line_comments'][file_path] = file_analysis['line_comments']
                 
                 # Java特定分析
                 if self._is_java_file(file_path):
@@ -1226,47 +1173,6 @@ class GitLabMRParser:
                 logger.exception(f"Error analyzing file: {change.get('new_path', 'unknown file')}")
                 
         return review_results
-
-    def _analyze_single_file(self, change: Dict[str, Any]) -> Dict[str, Any]:
-        """分析单个文件"""
-        file_path = change.get('new_path', '')
-        file_analysis = {
-            'file_path': file_path,
-            'change_type': self._determine_change_type(change),
-            'issues': [],
-            'warnings': [],
-            'suggestions': [],
-            'line_comments': {}  # 添加行评论收集
-        }
-
-        try:
-            if change.get('diff'):
-                current_line = 0
-                
-                # 分析diff获取行号
-                diff_lines = change['diff'].split('\n')
-                for line in diff_lines:
-                    if line.startswith('@@'):
-                        match = re.search(r'\+(\d+)', line)
-                        if match:
-                            current_line = int(match.group(1)) - 1
-                        continue
-                    
-                    if line.startswith('+'):
-                        current_line += 1
-                        # 分析新添加的代码行
-                        line_issues = self._analyze_code_line(line[1:], file_path)
-                        if line_issues:
-                            file_analysis['line_comments'][current_line] = line_issues
-                    
-                    elif line.startswith(' '):
-                        current_line += 1
-
-        except Exception as e:
-            logger.exception(f"Error analyzing file: {file_path}")
-            file_analysis['issues'].append(f"文件分析错误: {str(e)}")
-
-        return file_analysis
 
     def _submit_review_results(self, mr: ProjectMergeRequest, review_results: Dict[str, Any]) -> None:
         """提交评审结果"""
@@ -1437,7 +1343,115 @@ class GitLabMRParser:
             logger.exception(f"Failed to create batch comments for {file_path}")
             raise
 
-   
+    def _determine_change_type(self, change: Dict[str, Any]) -> str:
+        """
+        确定文件变更类型
+        
+        Args:
+            change: 变更信息字典，包含文件变更的详细信息
+            
+        Returns:
+            变更类型: 'added', 'modified', 'deleted', 'renamed', 'moved' 或 'unknown'
+        """
+        try:
+            # 检查新增文件
+            if change.get('new_file', False):
+                return 'added'
+                
+            # 检查删除文件
+            if change.get('deleted_file', False):
+                return 'deleted'
+                
+            # 检查重命名文件
+            if change.get('renamed_file', False):
+                return 'renamed'
+                
+            # 检查文件移动
+            if change.get('old_path') != change.get('new_path'):
+                return 'moved'
+                
+            # 默认为修改
+            if change.get('diff'):
+                return 'modified'
+                
+            return 'unknown'
+        
+        except Exception as e:
+            logger.exception(f"Error determining change type: {str(e)}")
+            return 'unknown'
+
+    def get_change_type_emoji(self, change_type: str) -> str:
+        """
+        获取变更类型对应的emoji
+        
+        Args:
+            change_type: 变更类型
+            
+        Returns:
+            对应的emoji字符串
+        """
+        type_emojis = {
+            'added': '✨',     # 新增
+            'modified': '📝',  # 修改
+            'deleted': '🗑️',   # 删除
+            'renamed': '🔄',   # 重命名
+            'moved': '📦',     # 移动
+            'unknown': '❓'    # 未知
+        }
+        return type_emojis.get(change_type, '❓')
+
+    def get_change_type_description(self, change_type: str) -> str:
+        """
+        获取变更类型的描述
+        
+        Args:
+            change_type: 变更类型
+            
+        Returns:
+            变更类型的描述文本
+        """
+        type_descriptions = {
+            'added': '新增文件',
+            'modified': '修改文件',
+            'deleted': '删除文件',
+            'renamed': '重命名文件',
+            'moved': '移动文件',
+            'unknown': '未知变更'
+        }
+        return type_descriptions.get(change_type, '未知变更')
+
+    def format_change_summary(self, change: Dict[str, Any]) -> str:
+        """
+        格式化变更摘要
+        
+        Args:
+            change: 变更信息字典
+            
+        Returns:
+            格式化的变更摘要文本
+        """
+        change_type = self._determine_change_type(change)
+        emoji = self.get_change_type_emoji(change_type)
+        description = self.get_change_type_description(change_type)
+        
+        summary_parts = [f"{emoji} {description}"]
+        
+        # 添加文件路径信息
+        if change_type == 'renamed' or change_type == 'moved':
+            summary_parts.append(f"从 `{change.get('old_path', '未知')}` 到 `{change.get('new_path', '未知')}`")
+        else:
+            file_path = change.get('new_path') or change.get('old_path', '未知')
+            summary_parts.append(f"`{file_path}`")
+        
+        # 添加变更统计
+        if change.get('diff'):
+            additions = len(re.findall(r'^\+[^+]', change['diff'], re.MULTILINE))
+            deletions = len(re.findall(r'^-[^-]', change['diff'], re.MULTILINE))
+            if additions or deletions:
+                summary_parts.append(f"(+{additions} -{deletions})")
+        
+        return ' '.join(summary_parts)
+
 
 
 def main():

@@ -1,6 +1,8 @@
 from typing import Dict, List, Any
 import os
 import openai
+from openai import OpenAI
+
 import re
 import time
 from dotenv import load_dotenv
@@ -12,8 +14,9 @@ class AICodeReviewer:
         self.api_key = os.getenv('OPENAI_API_KEY')
         if not self.api_key:
             raise ValueError("OPENAI_API_KEY not found in environment variables")
-        openai.api_key = self.api_key
-        
+        self.api_base = os.getenv('OPENAI_API_BASE', 'https://api.openai.com')
+        self.client = OpenAI(api_key=self.api_key,base_url=self.api_base)
+
         # 配置重试参数
         self.max_retries = 3
         self.retry_delay = 2
@@ -312,11 +315,13 @@ class AICodeReviewer:
         for attempt in range(self.max_retries):
             try:
                 return func(*args, **kwargs)
-            except openai.error.RateLimitError:
+            except openai.RateLimitError:
                 if attempt == self.max_retries - 1:
                     raise
-                time.sleep(self.retry_delay * (attempt + 1))
-            except openai.error.OpenAIError as e:
+                wait_time = self.retry_delay * (attempt + 1)
+                logger.warning(f"Rate limit reached. Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+            except openai.APIError as e:
                 logger.error(f"OpenAI API error: {str(e)}")
                 raise
             except Exception as e:
@@ -504,3 +509,187 @@ class AICodeReviewer:
         
         return comment
 
+    def _get_ai_response(self, prompt: str) -> str:
+        """
+        获取AI响应
+        
+        Args:
+            prompt: 提示文本
+            
+        Returns:
+            AI响应文本
+            
+        Raises:
+            Exception: API调用失败时抛出异常
+        """
+        try:
+            # 使用重试机制调用API
+            return self._retry_ai_request(self._make_ai_request, prompt)
+            
+        except openai.APIConnectionError as e:
+            logger.error(f"Failed to connect to OpenAI API: {str(e)}")
+            raise
+        except openai.RateLimitError as e:
+            logger.error(f"Rate limit exceeded: {str(e)}")
+            raise
+        except openai.APIError as e:
+            logger.error(f"API error: {str(e)}")
+            raise
+        except Exception as e:
+            logger.exception(f"Failed to get AI response: {str(e)}")
+            raise
+
+    def _make_ai_request(self, prompt: str) -> str:
+        """
+        执行OpenAI API请求
+        
+        Args:
+            prompt: 提示文本
+            
+        Returns:
+            AI响应文本
+        """
+        response =  self.client.chat.completions.create(
+            model="claude-3-5-sonnet-20241022",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """你是一个资深的代码评审专家，擅长:
+    1. 发现代码中的问题和潜在风险
+    2. 提供具体的改进建议
+    3. 确保代码符合最佳实践
+    4. 建议性能优化方案
+    5. 识别安全隐患
+    请以专业、清晰和建设性的方式提供代码评审意见。"""
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.7,
+            max_tokens=2000,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0
+        )
+        
+        return response.choices[0].message.content
+
+    def _parse_ai_response(self, response: str) -> Dict[str, Any]:
+        """
+        解析AI响应文本
+        
+        Args:
+            response: AI响应文本
+            
+        Returns:
+            解析后的结构化数据
+        """
+        try:
+            # 初始化结果结构
+            result = {
+                'success': True,
+                'review_result': response,
+                'suggestions': [],
+                'categories': {
+                    'code_quality': [],
+                    'best_practices': [],
+                    'performance': [],
+                    'security': [],
+                    'maintainability': []
+                },
+                'priorities': {
+                    'high': [],
+                    'medium': [],
+                    'low': []
+                }
+            }
+
+            # 分析响应文本
+            lines = response.split('\n')
+            current_category = None
+            current_priority = None
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # 检查分类标题
+                if line.endswith(':') and not line.startswith('-'):
+                    current_category = self._determine_category(line[:-1].lower())
+                    continue
+                    
+                # 检查优先级标记
+                priority_match = re.search(r'\[(高|中|低)优先级\]', line)
+                if priority_match:
+                    priority = {
+                        '高': 'high',
+                        '中': 'medium',
+                        '低': 'low'
+                    }.get(priority_match.group(1))
+                    if priority:
+                        current_priority = priority
+                        line = line.replace(priority_match.group(0), '').strip()
+                        
+                # 处理建议内容
+                if line.startswith(('-', '•', '*', '+')):
+                    suggestion = line[1:].strip()
+                    if suggestion:
+                        # 添加到总体建议列表
+                        result['suggestions'].append(suggestion)
+                        
+                        # 添加到分类列表
+                        if current_category and current_category in result['categories']:
+                            result['categories'][current_category].append(suggestion)
+                            
+                        # 添加到优先级列表
+                        if current_priority:
+                            result['priorities'][current_priority].append(suggestion)
+
+            # 处理代码示例
+            code_examples = re.findall(r'```(?:\w+)?\n(.*?)```', response, re.DOTALL)
+            if code_examples:
+                result['code_examples'] = code_examples
+                
+            # 提取总结性建议
+            summary_match = re.search(r'总结[：:](.*?)(?:\n\n|$)', response, re.DOTALL)
+            if summary_match:
+                result['summary'] = summary_match.group(1).strip()
+
+            return result
+            
+        except Exception as e:
+            logger.exception(f"Failed to parse AI response: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'review_result': response,
+                'suggestions': []
+            }
+
+    def _determine_category(self, text: str) -> str:
+        """
+        确定建议类别
+        
+        Args:
+            text: 文本内容
+            
+        Returns:
+            类别名称
+        """
+        category_keywords = {
+            'code_quality': ['代码质量', '代码风格', '命名', '格式'],
+            'best_practices': ['最佳实践', '设计模式', 'solid', '原则'],
+            'performance': ['性能', '效率', '优化', '复杂度'],
+            'security': ['安全', '漏洞', '注入', 'xss'],
+            'maintainability': ['可维护性', '复杂度', '测试', '文档']
+        }
+        
+        text = text.lower()
+        for category, keywords in category_keywords.items():
+            if any(keyword in text for keyword in keywords):
+                return category
+                
+        return 'code_quality'  # 默认分类
